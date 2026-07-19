@@ -78,6 +78,8 @@ sub options {
         'create-base-path' => { optional => 1 },
         'create-subdirs' => { optional => 1 },
         preallocation => { optional => 1 },
+        'copy-offload' => { optional => 1 },
+        'copy-offload-timeout' => { optional => 1 },
         # TODO: The new variant of mkdir with  `populate` vs `create`...
     };
 }
@@ -625,6 +627,16 @@ sub volume_has_feature {
         rename => {
             current => { qcow2 => 1, raw => 1, vmdk => 1 },
         },
+        # 'btrfs subvolume snapshot' is instant, shares extents copy-on-write, and is
+        # independent of its source straight away -- btrfs reference counts extents and
+        # does not pin an origin the way ZFS does. Only the formats this plugin stores
+        # as subvolumes qualify; qcow2 and vmdk are plain files here and would need the
+        # reflink path instead.
+        'copy-offload-atomic' => {
+            base => { raw => 1, subvol => 1 },
+            current => { raw => 1, subvol => 1 },
+            snap => { raw => 1, subvol => 1 },
+        },
     };
 
     my ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format) =
@@ -1000,6 +1012,244 @@ sub rename_snapshot {
 
 sub get_import_metadata {
     return PVE::Storage::DirPlugin::get_import_metadata(@_);
+}
+
+# ---- storage-offloaded full copy via subvolume snapshot ---------------------------
+#
+# 'btrfs subvolume snapshot' is instant and shares extents copy-on-write. btrfs
+# reference counts those extents and has no concept of an origin that must outlive its
+# snapshots, so the copy is independent immediately -- deleting the source is fine.
+# That satisfies 'copy-offload-atomic' with no background work, so copy_image_status()
+# is complete on the first poll.
+#
+# This is the same primitive clone_image() uses. The difference is what PVE records
+# afterwards: a linked clone carries a dependency it has to respect, while here we can
+# hand back a volume with no parent, because on btrfs there genuinely is none.
+#
+# Only 'raw' and 'subvol' are handled: those are the formats this plugin stores inside
+# subvolumes. qcow2 and vmdk are plain files here, so they would need the reflink path
+# and are not advertised.
+
+# Resolve a volume to the subvolume that backs it, honouring $snapname.
+my sub volume_subvol {
+    my ($class, $scfg, $volname, $snapname) = @_;
+
+    my (undef, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    my $path = $class->filesystem_path($scfg, $volname, $snapname);
+
+    return $format eq 'raw' ? raw_file_to_subvol($path) : $path;
+}
+
+# btrfs cannot snapshot across filesystems, and the target may be a different storage.
+#
+# Deliberately NOT st_dev or statfs f_fsid: btrfs gives every subvolume its own st_dev,
+# and folds the subvolume id into f_fsid too, so both differ between two subvolumes of
+# the ONE filesystem and would reject every legitimate copy. The filesystem UUID is the
+# only stable identity. This costs a command, but it runs in prepare(), never in the
+# freeze-sensitive start().
+my sub btrfs_fsid {
+    my ($path) = @_;
+
+    # 'btrfs filesystem show' takes a device or a mount point, not an arbitrary path,
+    # so resolve the containing mount first. Note this cannot be done with stat():
+    # coreutils' own %m reports a btrfs subvolume as its own mount point, for the same
+    # st_dev reason.
+    my $mnt;
+    eval {
+        run_command(
+            ['findmnt', '--noheadings', '--output', 'TARGET', '--target', $path],
+            outfunc => sub { $mnt //= $_[0] if $_[0] =~ /\S/ },
+        );
+    };
+    return (undef, " - $@") if $@;
+    return (undef, " - findmnt reported no mount point") if !defined($mnt);
+    chomp $mnt;
+
+    # Going by UUID rather than by mount point on purpose: one btrfs filesystem can be
+    # mounted at several places (a 'subvol=' mount per storage is a normal PVE setup),
+    # and a snapshot between them is perfectly valid.
+    my $uuid;
+    my $stderr = '';
+    eval {
+        run_command(
+            ['btrfs', 'filesystem', 'show', '--', $mnt],
+            outfunc => sub {
+                my ($line) = @_;
+                $uuid = $1 if !defined($uuid) && $line =~ m/\buuid:\s*(\S+)/i;
+            },
+            # A non-btrfs target is an ordinary "cannot offload this" answer, not a
+            # fault worth printing to the task log. The reason is returned to the
+            # caller instead, so it still ends up in the error it raises.
+            errfunc => sub { $stderr .= $_[0] },
+        );
+    };
+    return (undef, " - $@") if $@;
+    return (undef, $stderr =~ /\S/ ? " - $stderr" : " - no uuid in 'btrfs filesystem show'")
+        if !defined($uuid);
+    return ($uuid, undef);
+}
+
+sub copy_image_prepare {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_vmid, $snap, $opts,
+    ) = @_;
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    die "copy offload only handles VM images, not '$vtype'\n" if $vtype ne 'images';
+    die "btrfs copy offload cannot handle format '$format'\n"
+        if $format ne 'raw' && $format ne 'subvol';
+
+    # A subvolume snapshot copies the subvolume as it is; it cannot convert formats.
+    my $target_format = $opts->{format} // $format;
+    die "btrfs copy offload cannot convert '$format' to '$target_format'\n"
+        if $target_format ne $format;
+
+    my $subvol = volume_subvol($class, $scfg, $volname, $snap);
+    die "cannot copy '$volname': '$subvol' does not exist\n" if !-e $subvol;
+
+    my $imagedir = $class->get_subdir($target_scfg, 'images') . "/$target_vmid";
+    mkpath $imagedir;
+
+    # Keep "could not work out which filesystem this is" distinct from "they are two
+    # different filesystems". Reporting a mismatch when findmnt or btrfs is missing, or
+    # when the path is not on btrfs at all, sends people looking in the wrong place.
+    # findmnt needs the directory to exist, hence the mkpath above -- so tidy it away
+    # again on the paths that reject, rather than littering the target storage with an
+    # empty directory per refused attempt.
+    my $reject = sub {
+        rmdir($imagedir);    # only succeeds while empty, which is what we want
+        die $_[0];
+    };
+    my ($src_fsid, $src_err) = btrfs_fsid($subvol);
+    $reject->("cannot determine the btrfs filesystem of '$subvol'$src_err\n")
+        if !defined($src_fsid);
+    my ($dst_fsid, $dst_err) = btrfs_fsid($imagedir);
+    $reject->("cannot determine the btrfs filesystem of '$imagedir'$dst_err\n")
+        if !defined($dst_fsid);
+    $reject->("copy offload requires source and target on the same btrfs filesystem\n")
+        if $src_fsid ne $dst_fsid;
+
+    # the trailing 1 adds the format suffix; without it the volname does not parse
+    my $name =
+        $class->find_free_diskname($target_storeid, $target_scfg, $target_vmid, $format, 1);
+    my $target_volname = "$target_vmid/$name";
+
+    # Actually create the target, do not just pick a name. The caller runs this under
+    # the target storage lock and releases it before copy_image_start(), so a name that
+    # was merely chosen could be taken by a concurrent allocation in between -- and the
+    # caller's rollback would then free a volume belonging to that other operation.
+    # An empty subvolume costs nothing and is what free_image() already knows how to
+    # remove.
+    my $newsubvol = volume_subvol($class, $target_scfg, $target_volname, undef);
+
+    # Reap a placeholder left by an earlier copy that died between start() and
+    # status(). It is not merely litter: the rename in start() refuses to park onto an
+    # existing path, so without this every future offloaded copy to this name fails --
+    # and the leftover is invisible to list_images(), so nobody would know why. Safe
+    # here: we hold the target storage lock, we are outside any freeze, and the name is
+    # ours because find_free_diskname() just handed it out.
+    my $stale = "$newsubvol.copytmp";
+    if (-e $stale) {
+        warn "removing stale copy placeholder '$stale'\n";
+        $class->btrfs_cmd(['subvolume', 'delete', '--', $stale]);
+    }
+
+    $class->btrfs_cmd(['subvolume', 'create', '--', $newsubvol]);
+
+    # For 'raw' the volume is the disk.raw INSIDE the subvolume, and that file is what
+    # list_images() stats. Without it file_size_info() returns undef and the entry is
+    # skipped, which would make this reservation invisible to find_free_diskname() --
+    # defeating the point of creating it, and worse: the core prepares every disk of a
+    # VM before starting any of them, so the second prepare() for the same target would
+    # pick this same name and die on 'subvolume create'. Every multi-disk offloaded
+    # clone would fail. Create the file too, exactly as alloc_image does.
+    if ($format eq 'raw') {
+        my $raw = "$newsubvol/disk.raw";
+        my $fh;
+        if (!sysopen($fh, $raw, O_WRONLY | O_CREAT | O_EXCL, 0640)) {
+            my $err = $!;
+            eval { $class->btrfs_cmd(['subvolume', 'delete', '--', $newsubvol]); };
+            warn $@ if $@;
+            die "unable to reserve '$raw' - $err\n";
+        }
+        close($fh);
+    }
+
+    return $target_volname;
+}
+
+sub copy_image_start {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_volname, $snap,
+    ) = @_;
+
+    # Snapshot the source the caller asked for. Falling back to the current subvolume
+    # when a snapshot was requested would silently copy live data instead.
+    my $subvol = volume_subvol($class, $scfg, $volname, $snap);
+    my $newsubvol = volume_subvol($class, $target_scfg, $target_volname, undef);
+
+    # copy_image_prepare() reserved the name with a placeholder subvolume, and
+    # 'subvolume snapshot' will not write into a path that already exists. So: snapshot
+    # to a staging name, then ATOMICALLY EXCHANGE staging and the reserved name.
+    #
+    # PVE::Tools::renameat2(RENAME_EXCHANGE) rather than a pair of rename(2)s. Parking
+    # the placeholder aside and moving the copy in afterwards leaves the reserved name
+    # unheld in between, and for btrfs that genuinely loses the reservation: unlike
+    # lvmthin -- where find_free_diskname() reads the raw LV list and still sees the
+    # parked LV -- btrfs goes through list_images(), whose name pattern rejects the
+    # '.copytmp' suffix. A concurrent allocation could take the name, and the caller's
+    # rollback would then free somebody else's volume. With the exchange the name is
+    # occupied at every instant, by either the placeholder or the finished copy, so
+    # that window does not exist. The placeholder simply ends up at the staging path.
+    my $staging = "$newsubvol.copytmp";
+
+    # The expensive part, entirely off to one side; the reserved name is untouched, so
+    # a failure here needs no unwinding beyond dropping the staging subvolume.
+    eval { $class->btrfs_cmd(['subvolume', 'snapshot', '--', $subvol, $staging]); };
+    if (my $err = $@) {
+        eval { $class->btrfs_cmd(['subvolume', 'delete', '--', $staging]) if -e $staging; };
+        warn $@ if $@;
+        die $err;
+    }
+
+    # The paths are absolute, so pass -1 as the file descriptors -- same call this
+    # plugin already makes when rotating a rollback target into place.
+    if (!PVE::Tools::renameat2(-1, $staging, -1, $newsubvol, &PVE::Tools::RENAME_EXCHANGE)) {
+        my $rerr = $!;
+        # Nothing moved: the reserved name still holds the placeholder, so the caller's
+        # rollback frees exactly what it was given.
+        eval { $class->btrfs_cmd(['subvolume', 'delete', '--', $staging]); };
+        warn $@ if $@;
+        die "unable to swap the copy into '$newsubvol' - $rerr\n";
+    }
+
+    # The displaced placeholder, now sitting at the staging path, is deliberately NOT
+    # removed here. This runs while the caller may hold a guest filesystem frozen, and
+    # removing it is pure cleanup nothing depends on -- copy_image_status() does it.
+    return;
+}
+
+sub copy_image_status {
+    my ($class, $scfg, $storeid, $volname, $source) = @_;
+
+    # $volname is the TARGET. The snapshot is complete and independent the moment btrfs
+    # returns, so there is nothing to poll; what is left is dropping the placeholder
+    # copy_image_start() parked, which is done here to keep it out of the freeze window.
+    my ($vtype, undef, undef, undef, undef, undef, $format) =
+        eval { $class->parse_volname($volname) };
+    if (!$@ && defined($vtype) && $vtype eq 'images' && defined($format)
+        && ($format eq 'raw' || $format eq 'subvol'))
+    {
+        my $parked = volume_subvol($class, $scfg, $volname, undef) . '.copytmp';
+        if (-e $parked) {
+            eval { $class->btrfs_cmd(['subvolume', 'delete', '--', $parked]); };
+            warn $@ if $@;
+        }
+    }
+
+    return { state => 'complete' };
 }
 
 1
