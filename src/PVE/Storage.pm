@@ -41,11 +41,11 @@ use PVE::Storage::BTRFSPlugin;
 use PVE::Storage::ESXiPlugin;
 
 # Storage API version. Increment it on changes in storage API interface.
-use constant APIVER => 15;
+use constant APIVER => 16;
 # Age is the number of versions we're backward compatible with.
 # This is like having 'current=APIVER' and age='APIAGE' in libtool,
 # see https://www.gnu.org/software/libtool/manual/html_node/Libtool-versioning.html
-use constant APIAGE => 6;
+use constant APIAGE => 7;
 
 our $KNOWN_EXPORT_FORMATS = ['raw+size', 'tar+size', 'qcow2+size', 'vmdk+size', 'zfs', 'btrfs'];
 
@@ -1096,6 +1096,239 @@ sub vdisk_clone {
             return "$storeid:$volname";
         },
     );
+}
+
+# Returns the copy-offload class usable for $volid -> $target_storeid, or undef.
+#
+# Offload requires: the target storage to have copy-offload enabled, both storages to be
+# instances of the same plugin type, and the plugin to advertise a class for this volume.
+# 'atomic' is preferred when a plugin advertises both, as it needs no host-side mirror.
+sub copy_offload_class {
+    my ($cfg, $volid, $target_storeid, $snap, $running) = @_;
+
+    my ($storeid, $volname) = parse_volume_id($volid, 1);
+    return undef if !$storeid;
+
+    my $scfg = storage_config($cfg, $storeid);
+    my $target_scfg = storage_config($cfg, $target_storeid);
+
+    return undef if !$target_scfg->{'copy-offload'};
+    return undef if $scfg->{type} ne $target_scfg->{type};
+
+    for my $class (qw(atomic bulk)) {
+        return $class
+            if volume_has_feature($cfg, "copy-offload-$class", $volid, $snap, $running);
+    }
+
+    return undef;
+}
+
+# Allocate the target of an offloaded copy, returning the new volid. Its CONTENT is
+# undefined until vdisk_copy_start() has been called for it.
+#
+# Split out from the start so a caller cloning a running guest can prepare every disk's
+# target first and then start them all inside a single guest freeze; see vdisk_copy().
+#
+# Only this half runs under the storage lock -- it is where the allocation happens, and
+# it is bounded. The copy itself must not run under the lock: for shared storage that is
+# a pmxcfs lock whose locked code is killed by an alarm(60) in PVE::Cluster, while a full
+# array copy runs for minutes to hours. The host-side path is arranged the same way,
+# allocating under the lock and running the long qemu-img convert outside it.
+sub vdisk_copy_prepare {
+    my ($cfg, $volid, $target_storeid, $target_vmid, $snap, $opts) = @_;
+
+    my ($storeid, $volname) = parse_volume_id($volid);
+
+    my $scfg = storage_config($cfg, $storeid);
+    my $target_scfg = storage_config($cfg, $target_storeid);
+
+    my $plugin = PVE::Storage::Plugin->lookup($scfg->{type});
+
+    activate_storage($cfg, $storeid);
+    activate_storage($cfg, $target_storeid) if $target_storeid ne $storeid;
+
+    my $new_volname = $plugin->cluster_lock_storage(
+        $target_storeid,
+        $target_scfg->{shared},
+        undef,
+        sub {
+            return $plugin->copy_image_prepare(
+                $scfg, $storeid, $volname,
+                $target_scfg, $target_storeid, $target_vmid, $snap, $opts,
+            );
+        },
+    );
+
+    return "$target_storeid:$new_volname";
+}
+
+# Pin the source's point-in-time and begin copying into a prepared target.
+#
+# MUST stay cheap: a caller cloning a running guest holds a filesystem freeze across
+# this call for every disk of the VM. It deliberately takes no storage lock -- the
+# allocation already happened in vdisk_copy_prepare(), and taking a cluster lock inside
+# a guest freeze would be a bad trade.
+sub vdisk_copy_start {
+    my ($cfg, $volid, $target_volid, $snap) = @_;
+
+    my ($storeid, $volname) = parse_volume_id($volid);
+    my ($target_storeid, $target_volname) = parse_volume_id($target_volid);
+
+    my $scfg = storage_config($cfg, $storeid);
+    my $target_scfg = storage_config($cfg, $target_storeid);
+
+    my $plugin = PVE::Storage::Plugin->lookup($scfg->{type});
+
+    return $plugin->copy_image_start(
+        $scfg, $storeid, $volname, $target_scfg, $target_storeid, $target_volname, $snap,
+    );
+}
+
+# Start several prepared copies, grouping them so a backend that can capture multiple
+# volumes at one instant does so. $copies is an arrayref of
+# { source => $volid, target => $target_volid }.
+#
+# Copies are grouped by their (source storage, target storage) pair, since that is the
+# granularity at which a backend can act atomically; each group is handed to the
+# plugin's copy_images_start(), whose default simply starts them one by one.
+#
+# Same constraints as vdisk_copy_start(): cheap, no locking -- the caller may hold a
+# guest freeze across this.
+sub vdisk_copy_start_group {
+    my ($cfg, $copies) = @_;
+
+    return if !$copies || !scalar(@$copies);
+
+    my $groups = {};
+    for my $copy (@$copies) {
+        my ($storeid, $volname) = parse_volume_id($copy->{source});
+        my ($target_storeid, $target_volname) = parse_volume_id($copy->{target});
+
+        my $key = "$storeid/$target_storeid";
+        $groups->{$key} //= {
+            storeid => $storeid,
+            target_storeid => $target_storeid,
+            copies => [],
+        };
+        push $groups->{$key}->{copies}->@*,
+            { source => $volname, target => $target_volname, snap => $copy->{snap} };
+        push $groups->{$key}->{orig}->@*, $copy;
+    }
+
+    # Mark each group's copies started as soon as THAT group returns, not after the
+    # whole batch. A later group can fail, and the caller must still know which copies
+    # are actually running -- otherwise cleanup cannot tell a started copy from one that
+    # never began, and would either leak a running copy or wait for one that will never
+    # report.
+    for my $key (sort keys %$groups) {
+        my $group = $groups->{$key};
+
+        my $scfg = storage_config($cfg, $group->{storeid});
+        my $target_scfg = storage_config($cfg, $group->{target_storeid});
+
+        my $plugin = PVE::Storage::Plugin->lookup($scfg->{type});
+
+        $plugin->copy_images_start(
+            $scfg, $group->{storeid},
+            $target_scfg, $group->{target_storeid},
+            $group->{copies},
+        );
+
+        $_->{started} = 1 for $group->{orig}->@*;
+    }
+
+    return;
+}
+
+# Wait for a started copy to become independent of its source. Frees the target and
+# re-raises on failure, so the caller never leaks a half-copied volume.
+#
+# $progress is an optional coderef called with a percentage.
+sub vdisk_copy_wait {
+    my ($cfg, $target_volid, $volid, $progress) = @_;
+
+    my ($target_storeid, $target_volname) = parse_volume_id($target_volid);
+
+    my $target_scfg = storage_config($cfg, $target_storeid);
+    my $plugin = PVE::Storage::Plugin->lookup($target_scfg->{type});
+
+    # What the copy was made from, so the plugin can clean up state it left there.
+    my $source;
+    if ($volid) {
+        my ($storeid, $volname) = parse_volume_id($volid);
+        $source = {
+            scfg => storage_config($cfg, $storeid),
+            storeid => $storeid,
+            volname => $volname,
+        };
+    }
+
+    # A bounded wait, not a bare loop: a backend whose copy dies can otherwise report
+    # 'pending' forever and hang this worker with no error and no progress. The deadline
+    # is generous because the copy is a full data copy, and it is reset whenever the
+    # backend reports forward progress, so a slow-but-live copy is never killed.
+    my $timeout = $target_scfg->{'copy-offload-timeout'} // (24 * 3600);
+    my $deadline = time() + $timeout;
+    my $last_progress;
+
+    eval {
+        while (1) {
+            my $status = $plugin->copy_image_status(
+                $target_scfg, $target_storeid, $target_volname, $source,
+            );
+
+            my $state = $status->{state} // '';
+            my $done = $status->{progress};
+
+            if (defined($done) && (!defined($last_progress) || $done != $last_progress)) {
+                $progress->($done) if $progress;
+                $last_progress = $done;
+                $deadline = time() + $timeout; # forward progress: give it the full budget again
+            }
+
+            last if $state eq 'complete';
+
+            die "copy of '$target_volid' reported unexpected state '$state'\n"
+                if $state ne 'pending';
+
+            die "copy of '$target_volid' did not finish within ${timeout}s\n"
+                if time() >= $deadline;
+
+            sleep(1);
+        }
+    };
+    if (my $err = $@) {
+        # includes a worker abort (die from the poll loop): do not leak the target
+        eval { vdisk_free($cfg, $target_volid) };
+        warn "could not clean up target volume '$target_volid' - $@" if $@;
+        die $err;
+    }
+
+    return $target_volid;
+}
+
+# Offload a full copy of $volid to $target_storeid, returning the new volid.
+#
+# The simple path, for a source nothing is writing to: prepare, start, wait. A caller
+# cloning a RUNNING guest must not use this -- it has to prepare every disk, then start
+# them all inside one freeze, then wait -- see the three calls above.
+#
+# The caller is responsible for checking copy_offload_class() first and, for the 'bulk'
+# class with a running guest, for the write-tracking/convergence the class implies.
+sub vdisk_copy {
+    my ($cfg, $volid, $target_storeid, $target_vmid, $snap, $opts, $progress) = @_;
+
+    my $target_volid =
+        vdisk_copy_prepare($cfg, $volid, $target_storeid, $target_vmid, $snap, $opts);
+
+    eval { vdisk_copy_start($cfg, $volid, $target_volid, $snap) };
+    if (my $err = $@) {
+        eval { vdisk_free($cfg, $target_volid) };
+        warn "could not clean up target volume '$target_volid' - $@" if $@;
+        die $err;
+    }
+
+    return vdisk_copy_wait($cfg, $target_volid, $volid, $progress);
 }
 
 sub vdisk_create_base {

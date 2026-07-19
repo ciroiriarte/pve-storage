@@ -6,6 +6,30 @@ without breaking anything unaware of it.)
 
 Future changes should be documented in here.
 
+## Version 16:
+
+* Add optional `copy_image_prepare()`, `copy_image_start()`, `copy_image_status()` and
+  `copy_images_start()` plugin methods, plus a `copy-offload` storage option
+
+  These let a plugin perform a full copy (e.g. a full clone) on the storage backend instead of
+  reading and writing the data through the host. They are optional: the base implementations die,
+  and are only reached if a plugin advertises one of the new `copy-offload-atomic` or
+  `copy-offload-bulk` features from `volume_has_feature()`, so existing plugins are unaffected.
+
+  The copy is asynchronous. `copy_image_prepare()` allocates the target and returns its volname,
+  `copy_image_start()` fixes the copy's point in time and begins it, and `copy_image_status()` is
+  polled until the target is INDEPENDENT of its source -- not merely readable. Splitting the two
+  matters for callers that must capture several volumes at one instant: only the start needs to
+  happen inside a guest freeze, and it must stay cheap enough to do so.
+
+  `copy_images_start()` starts a batch between the same pair of storages. Its default
+  implementation simply starts them one by one, so it needs no capability negotiation; a backend
+  that can capture several volumes atomically overrides it.
+
+  Note that `copy_image_start()` receives the source `$snapname`: it is the call that fixes the
+  point in time, so a plugin that instead snapshots the current image would silently copy live
+  data when a snapshot was requested.
+
 ## Version 15:
 
 * Add new `$snapname` parameter to the `volume_resize()` plugin method

@@ -197,6 +197,26 @@ my $defaultData = {
             type => 'boolean',
             optional => 1,
         },
+        'copy-offload-timeout' => {
+            description =>
+                "Maximum time in seconds to wait for an offloaded copy to become "
+                . "independent of its source. The timer restarts whenever the backend "
+                . "reports progress, so this bounds a stalled copy rather than a slow one.",
+            type => 'integer',
+            minimum => 1,
+            optional => 1,
+            default => 24 * 3600,
+        },
+        'copy-offload' => {
+            description =>
+                "Offload full-copy operations (e.g. full clone) to the storage backend "
+                . "instead of copying the data through the host. Only honored by plugins that "
+                . "advertise a 'copy-offload-atomic' or 'copy-offload-bulk' feature; ignored "
+                . "otherwise. Both source and target must be instances of the same plugin type.",
+            type => 'boolean',
+            optional => 1,
+            default => 0,
+        },
         subdir => {
             description => "Subdir to mount.",
             type => 'string',
@@ -1046,6 +1066,150 @@ sub clone_image {
     return $newvol;
 }
 
+# START a full copy of $volname onto the TARGET storage, returning the new volname
+# there. The copy is ASYNCHRONOUS: this returns as soon as the backend has accepted the
+# job, and the caller then polls copy_image_status() until the copy is complete.
+#
+# It must be async because a full array copy runs for minutes to hours, while the core
+# calls this under cluster_lock_storage(). For shared storage that is a pmxcfs lock,
+# whose locked code is killed by an alarm(60) (PVE::Cluster) -- so a blocking copy would
+# be aborted mid-flight and the lock broken. Splitting start from wait also mirrors what
+# the host-side path already does: it allocates under the lock and runs the long
+# qemu-img convert outside it.
+#
+# Returning the target volname immediately (rather than only when the data is there) is
+# deliberate: the caller can record it for rollback before anything can go wrong, and
+# free_image() is the cleanup path if the copy later fails or is aborted. A plugin MUST
+# therefore accept free_image() on a volume whose copy is still in flight, cancelling
+# the backend job.
+#
+# Only called when the plugin advertises 'copy-offload-atomic' or 'copy-offload-bulk'
+# via volume_has_feature() and the target storage has copy-offload enabled, so the base
+# implementation dies rather than returning undef: reaching it means a plugin advertised
+# a capability it does not implement.
+#
+# $target_scfg/$target_storeid describe the TARGET storage. A plugin only ever receives
+# its own per-instance scfg, so it cannot judge whether a given source/target pair can
+# actually be copied by the backend (same array, same pool group, ...) without them.
+# Both are guaranteed to be instances of the same plugin type as the source; cross-type
+# offload is out of scope, since the operation is opaque to PVE and cannot be lowered to
+# volume_export/volume_import the way a generic copy can.
+#
+# $snap is optional: copy from that snapshot rather than the current state.
+# $opts->{format} is the format the caller resolved for the target. A plugin that cannot
+# produce it MUST die here rather than silently producing something else.
+#
+# The copy is split into prepare + start so that a caller cloning a RUNNING guest can
+# hold all the disks of a VM at one point in time: it prepares every target first, then
+# fs-freezes the guest once and calls copy_image_start() for each disk inside that
+# freeze. Consistency across disks is a VM-level property, so the core needs a cheap
+# operation it can put inside a freeze -- which allocation is not.
+sub copy_image_prepare {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_vmid, $snap, $opts,
+    ) = @_;
+
+    die "storage plugin '" . $class->type() . "' does not implement copy_image_prepare\n";
+}
+
+# Fix the source's point-in-time and begin copying it into the target that
+# copy_image_prepare() returned. Only after this returns is the copy's content defined.
+#
+# MUST BE FAST AND MUST NOT BLOCK: the caller may hold a guest filesystem freeze (or a
+# suspended VM) across this call for every disk of a VM. Do the minimum that pins the
+# source -- create the snapshot/pair -- and let the data movement proceed in the
+# background, reported by copy_image_status().
+#
+# For the 'copy-offload-atomic' class this call is what defines the copy's point in
+# time; writes to the source after it returns MUST NOT affect the result. A plugin that
+# cannot make that guarantee must advertise 'copy-offload-bulk' instead.
+#
+# $snap names the source snapshot to copy from, or is undef for the current state. It
+# is passed HERE and not only to prepare because this call is what fixes the point in
+# time: a plugin that took its own snapshot of the current image here would silently
+# copy live data when the caller asked for a snapshot.
+sub copy_image_start {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_volname, $snap,
+    ) = @_;
+
+    die "storage plugin '" . $class->type() . "' does not implement copy_image_start\n";
+}
+
+# Start several copies as ONE operation. $copies is an arrayref of
+# { source => $volname, target => $target_volname, snap => $snap }, all between the
+# same pair of storages. As in copy_image_start(), 'snap' names the source snapshot to
+# copy from and may be undef; each copy in a batch carries its own.
+#
+# The default implementation just starts them one after another, which is what the
+# caller would otherwise do itself -- so there is nothing to advertise and nothing to
+# negotiate. A backend that can capture several volumes at one instant (an array
+# consistency group) overrides this, and every caller gets the stronger guarantee for
+# free.
+#
+# Overriding it buys two things for a multi-disk guest. The capture becomes atomic in
+# the backend rather than merely bracketed by a guest freeze, so the disks are mutually
+# crash-consistent even if the freeze does not apply -- e.g. no guest agent is
+# available. And the freeze, when there is one, shrinks from N sequential backend calls
+# to one, which for a guest with many disks is the difference between a perceptible
+# stall and none.
+#
+# The plugin decides how to group. It may start the batch as one backend group, as
+# several, or one by one -- whatever its backend supports and its own metadata calls
+# for, e.g. volumes that must stay in separate groups because they live in different
+# pools, or because the backend caps how many volumes a group may hold. The core does
+# not model any of that and passes the whole batch for a given pair of storages.
+#
+# What the core does guarantee is that every start in the batch happens inside one
+# guest freeze. So the consistency a caller gets is: mutually crash-consistent WITHIN
+# each backend group by the backend itself, and consistent ACROSS groups only by virtue
+# of that freeze. A plugin that splits a batch it could have kept in one group is
+# therefore trading away the guarantee that survives when no freeze is possible -- when
+# there is no guest agent and the caller has to fall back to suspending the VM.
+#
+# Same contract as copy_image_start(): fast, non-blocking, and for the atomic class it
+# is this call that fixes the point in time of every copy in the group.
+sub copy_images_start {
+    my ($class, $scfg, $storeid, $target_scfg, $target_storeid, $copies) = @_;
+
+    for my $copy (@$copies) {
+        $class->copy_image_start(
+            $scfg, $storeid, $copy->{source},
+            $target_scfg, $target_storeid, $copy->{target}, $copy->{snap},
+        );
+    }
+
+    return;
+}
+
+# Poll a copy started by copy_image(). Returns a hashref:
+#
+#   { state => 'pending'|'complete', progress => $percent }
+#
+# 'progress' is optional and informational only. On failure this MUST die; the caller
+# then frees the target volume.
+#
+# 'complete' means the target is INDEPENDENT of the source -- not merely that the data
+# is readable. For backends where independence is asynchronous (an RBD flatten, a ZFS
+# clone still tied to its origin, an array pair that has not dissolved yet) reporting
+# 'complete' early produces something that is not a full copy, and the caller is then
+# free to delete the source.
+#
+# This is called OUTSIDE the storage lock, so it may talk to the backend, but it should
+# stay cheap: it runs in a poll loop.
+#
+# $source is { scfg, storeid, volname } describing what the copy was made FROM. A
+# plugin may need it to clean up state it left on the source -- an RBD copy, for
+# instance, is a clone of a snapshot taken on the source image, and once the copy is
+# independent nothing else records where it came from.
+sub copy_image_status {
+    my ($class, $scfg, $storeid, $volname, $source) = @_;
+
+    die "storage plugin '" . $class->type() . "' does not implement copy_image_status\n";
+}
+
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
 
@@ -1572,6 +1736,18 @@ sub storage_can_replicate {
     return 0;
 }
 
+# Besides the features listed below, a plugin may advertise one of the two copy-offload
+# classes (see copy_image()). They are separate features rather than one feature with a
+# class argument so that this interface stays unchanged; a plugin supports whichever one
+# fits its backend, and a caller that can use both prefers 'copy-offload-atomic':
+#
+#   copy-offload-atomic  The backend can produce the copy from a static point-in-time
+#                        source (snapshot/clone), so no host-side mirror is needed to
+#                        keep it consistent while the source keeps changing.
+#   copy-offload-bulk    The copy is a bulk data movement that smears over a changing
+#                        source (e.g. NFS 4.2 server-side copy, zfs send/recv). For a
+#                        running guest the caller must track writes and converge, the
+#                        way live migration does.
 sub volume_has_feature {
     my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
 
