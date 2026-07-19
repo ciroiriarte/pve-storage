@@ -298,7 +298,10 @@ sub clone_image {
     $imagedir .= "/$vmid";
     mkpath $imagedir;
 
-    my $path = $class->filesystem_path($scfg, $volname);
+    # Clone the snapshot the caller asked for, not the live subvolume. Dropping $snap
+    # here silently produced a clone of the CURRENT state while the caller believed it
+    # had cloned the snapshot.
+    my $path = $class->filesystem_path($scfg, $volname, $snap);
     my $newname = $class->find_free_diskname($storeid, $scfg, $vmid, $format, 1);
 
     # For btrfs subvolumes we don't actually need the "link":
