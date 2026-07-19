@@ -18,6 +18,7 @@ my $res = $harness->runtests(
     "filesystem_path_test.pm",
     "prune_backups_test.pm",
     "copy_offload_test.pm",
+    "copy_offload_naming_test.pm",
 );
 
 exit -1 if !$res || $res->{failed} || $res->{parse_errors};

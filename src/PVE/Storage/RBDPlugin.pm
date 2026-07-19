@@ -468,6 +468,8 @@ sub options {
         krbd => { optional => 1 },
         keyring => { optional => 1 },
         bwlimit => { optional => 1 },
+        'copy-offload' => { optional => 1 },
+        'copy-offload-timeout' => { optional => 1 },
     };
 }
 
@@ -701,6 +703,279 @@ sub clone_image {
     return $newvol;
 }
 
+# ---- storage-offloaded full copy -------------------------------------------------
+#
+# Ceph can produce a full copy without moving the data through the host: snapshot the
+# source, clone the snapshot (copy-on-write, instant), then flatten the clone. The
+# flatten is what actually copies, and it runs on the Ceph cluster.
+#
+# That maps onto the hook's three phases as follows:
+#
+#   prepare  pick the target name. Nothing exists on the cluster yet.
+#   start    snap + protect + clone. Both are O(1) metadata operations, so this is
+#            safe to run inside a guest freeze, and it is what FIXES the copy's point
+#            in time -- writes to the source afterwards cannot affect the clone.
+#   status   pending until the flatten has removed the clone's parent, i.e. until the
+#            target is genuinely INDEPENDENT and the source may be deleted.
+#
+# The last point is why 'complete' is defined as independent rather than readable: a
+# clone is fully readable the moment it exists, but deleting the source out from under
+# an unflattened clone would destroy it.
+
+my $rbd_copy_snap = sub {
+    my ($target_volname) = @_;
+    # Derived from the target name so status/cleanup can find it again without state.
+    return "__copy_$target_volname";
+};
+
+# Names for the two transient images a copy needs: the clone as it is being built, and
+# the placeholder once it has been moved out of the way.
+#
+# Both use a PREFIX. rbd_ls(), which feeds list_images(), selects on the ANCHORED
+# m/^(?:vm|base)-(\d+)-/, so a prefixed name is invisible there and never appears as a
+# phantom disk of that VM. find_free_diskname() meanwhile passes the RAW 'rbd ls' output
+# to get_next_vm_diskname(), whose disk-number regex is UNANCHORED, so a prefixed name
+# still reserves the disk NUMBER. Invisible and still reserving is exactly what these
+# need; a '.copytmp' SUFFIX would have been the opposite on both counts.
+my sub copy_staging_name { return "copynew-$_[0]" }
+my sub copy_parked_name { return "copytmp-$_[0]" }
+
+# Remove transient images a previous copy to this name left behind. They are invisible
+# to list_images(), so nothing else would ever reap them, and a leftover placeholder
+# would make the rename in copy_image_start() fail for every future copy to this name.
+my sub copy_reap_leftovers {
+    my ($scfg, $storeid, $volname) = @_;
+
+    for my $stale (copy_staging_name($volname), copy_parked_name($volname)) {
+        next if !rbd_volume_exists($scfg, $storeid, $stale);
+        warn "removing stale copy image '$stale'\n";
+        eval {
+            my $c = $rbd_cmd->($scfg, $storeid, 'rm', $stale);
+            run_rbd_command($c, errmsg => "rbd rm stale '$stale' error");
+        };
+        warn $@ if $@;
+    }
+}
+
+sub copy_image_prepare {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_vmid, $snap, $opts,
+    ) = @_;
+
+    die "storage '$target_storeid' is on a different Ceph cluster - cannot clone across\n"
+        if ($scfg->{monhost} // '') ne ($target_scfg->{monhost} // '');
+
+    my $format = $opts->{format} // 'raw';
+    die "rbd copy offload cannot produce format '$format'\n" if $format ne 'raw';
+
+    my $name = $class->find_free_diskname($target_storeid, $target_scfg, $target_vmid);
+
+    # Safe here: we hold the target storage lock, and the name is ours because
+    # find_free_diskname() just handed it out.
+    copy_reap_leftovers($target_scfg, $target_storeid, $name);
+
+    # Actually CREATE the target, do not just pick a name. The caller runs this under
+    # the target storage lock and releases it before copy_image_start(), so a name that
+    # was merely chosen could be taken by a concurrent allocation in between -- and the
+    # caller's rollback would then free a volume belonging to that other operation.
+    # Creating it here makes the reservation real and the "prepared targets are
+    # freeable" contract true.
+    #
+    # Deliberately the SMALLEST image rbd accepts, not the source's size: this
+    # placeholder exists only to hold the name until copy_image_start() renames the real
+    # clone over it, and start has to delete it while the caller may be holding a guest
+    # frozen. 'rbd rm' walks every object of an image, so a full-size placeholder stalls
+    # the guest in proportion to the disk -- seconds for a GiB, far worse for a TiB.
+    # Anything up to the 4 MiB object size is a single object, so this is as cheap to
+    # delete as an image can be.
+    my $cmd = $rbd_cmd->(
+        $target_scfg, $target_storeid, 'create', '--image-format', '2',
+        '--size', '4K', $name,
+    );
+    push $cmd->@*, ('--data-pool', $target_scfg->{'data-pool'})
+        if $target_scfg->{'data-pool'};
+    run_rbd_command($cmd, errmsg => "rbd create '$name' error");
+
+    return $name;
+}
+
+sub copy_image_start {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_volname, $snap,
+    ) = @_;
+
+    my (undef, $name) = $class->parse_volname($volname);
+
+    # Copy from the snapshot the caller asked for. Taking our own snapshot of the
+    # current image would silently copy live data when a snapshot was requested.
+    my $src_snap = $snap;
+    my $own_snap;
+    if (!defined($src_snap)) {
+        $own_snap = $rbd_copy_snap->($target_volname);
+        my $cmd = $rbd_cmd->($scfg, $storeid, 'snap', 'create', $name, '--snap', $own_snap);
+        run_rbd_command($cmd, errmsg => "rbd snap create '$name' error");
+        $src_snap = $own_snap;
+    }
+
+    my $tmp = copy_staging_name($target_volname);
+    my $parked = copy_parked_name($target_volname);
+
+    my $ok = eval {
+        # Clone format 2 so no snapshot protection is needed -- required when copying
+        # from a caller-supplied snapshot we do not own and must not protect/unprotect.
+        my @options = (
+            '--rbd-default-clone-format', '2',
+            get_rbd_path($scfg, $name), '--snap', $src_snap,
+        );
+        push @options, ('--data-pool', $target_scfg->{'data-pool'})
+            if $target_scfg->{'data-pool'};
+
+        my $cmd = $rbd_cmd->(
+            $scfg, $storeid, 'clone', @options, get_rbd_path($target_scfg, $tmp),
+        );
+        run_rbd_command($cmd, errmsg => "rbd clone '$name' error");
+
+        # Swap the clone into the reserved name. MOVE the placeholder aside rather than
+        # deleting it first: 'rbd rm' followed by 'rbd rename' leaves the disk number
+        # unreserved in between, and a concurrent allocation could take it -- after
+        # which this copy's rollback would free somebody else's volume. Parked under a
+        # prefixed name it stays invisible to list_images() while still reserving the
+        # number, so nothing can claim it. Removing it is left to copy_image_status(),
+        # since 'rbd rm' is not something to run while the caller holds a guest frozen.
+        $cmd = $rbd_cmd->($target_scfg, $target_storeid, 'rename', $target_volname, $parked);
+        run_rbd_command($cmd, errmsg => "rbd rename placeholder '$target_volname' error");
+        $cmd = $rbd_cmd->($target_scfg, $target_storeid, 'rename', $tmp, $target_volname);
+        if (!eval { run_rbd_command($cmd, errmsg => "rbd rename '$tmp' error"); 1 }) {
+            my $rerr = $@;
+            # Put the reservation back so the caller's rollback frees what it was given.
+            my $c = $rbd_cmd->($target_scfg, $target_storeid, 'rename', $parked,
+                $target_volname);
+            eval { run_rbd_command($c, errmsg => "restoring placeholder error") };
+            warn $@ if $@;
+            die $rerr;
+        }
+
+        # Hand the flatten to the Ceph manager rather than running it here: it is the
+        # actual data copy, it must not block a caller that may be holding a guest
+        # freeze, and a cluster-side task survives this worker dying. It is also
+        # cancellable, which a detached child process would not have been.
+        $cmd = ['ceph', 'rbd', 'task', 'add', 'flatten',
+            "$target_scfg->{pool}/$target_volname"];
+        run_command($cmd, errmsg => "scheduling rbd flatten failed", outfunc => sub { });
+        1;
+    };
+    if (my $err = $@) {
+        # Own cleanup: leave the source exactly as it was.
+        eval {
+            my $c = $rbd_cmd->($target_scfg, $target_storeid, 'rm', $tmp);
+            run_rbd_command($c, errmsg => "rbd rm '$tmp' error");
+        };
+        if (rbd_volume_exists($target_scfg, $target_storeid, $parked)) {
+            eval {
+                my $c = $rbd_cmd->($target_scfg, $target_storeid, 'rm', $parked);
+                run_rbd_command($c, errmsg => "rbd rm placeholder '$parked' error");
+            };
+            warn $@ if $@;
+        }
+        if ($own_snap) {
+            eval {
+                my $c = $rbd_cmd->($scfg, $storeid, 'snap', 'rm', $name, '--snap', $own_snap);
+                run_rbd_command($c, errmsg => "rbd snap rm '$name' error");
+            };
+        }
+        die $err;
+    }
+
+    return;
+}
+
+# Find the manager-side flatten task for an image, if one is queued or running.
+my $rbd_flatten_task = sub {
+    my ($scfg, $volname) = @_;
+
+    my $out = '';
+    eval {
+        run_command(['ceph', 'rbd', 'task', 'list', '--format', 'json'],
+            outfunc => sub { $out .= shift });
+    };
+    return undef if $@ || $out !~ /\S/;
+
+    my $tasks = eval { decode_json($out) } // [];
+    for my $task (@$tasks) {
+        my $refs = $task->{refs} // {};
+        next if ($refs->{action} // '') ne 'flatten';
+        next if ($refs->{image_name} // '') ne $volname;
+        next if ($refs->{pool_name} // '') ne ($scfg->{pool} // '');
+        return $task;
+    }
+
+    return undef;
+};
+
+sub copy_image_status {
+    my ($class, $scfg, $storeid, $volname, $source) = @_;
+
+    my (undef, $name) = $class->parse_volname($volname);
+
+    my $cmd = $rbd_cmd->($scfg, $storeid, 'info', $name, '--format', 'json');
+    my $info = '';
+    run_rbd_command($cmd, errmsg => "rbd info '$name' error", outfunc => sub { $info .= shift });
+
+    my $parent = eval { decode_json($info)->{parent} };
+
+    # No parent: the flatten finished and the image is INDEPENDENT -- which is the
+    # difference that matters. A clone is readable from the moment it exists, but
+    # deleting the source before the flatten completes would destroy it.
+    if (!$parent) {
+        # Drop the snapshot this copy was taken from, on the SOURCE image. Once the
+        # flatten completes the target no longer records where it came from, so this is
+        # the last chance to find it -- and leaving it behind pins space on the source
+        # and blocks deleting that volume later.
+        #
+        # Only ever our own: the name is derived from the target, so a caller-supplied
+        # snapshot can never match and is left untouched.
+        if ($source) {
+            my $own_snap = $rbd_copy_snap->($volname);
+            my (undef, $src_name) = $class->parse_volname($source->{volname});
+            eval {
+                my $c = $rbd_cmd->(
+                    $source->{scfg}, $source->{storeid},
+                    'snap', 'rm', $src_name, '--snap', $own_snap,
+                );
+                run_rbd_command($c, errmsg => "rbd snap rm error", outfunc => sub { });
+            };
+        }
+        # The placeholder copy_image_start() parked. Deliberately not removed there:
+        # 'rbd rm' walks every object and that call can run with a guest frozen. Best
+        # effort -- the copy is already complete and correct, and dying here would make
+        # the caller free it.
+        my $parked = copy_parked_name($name);
+        if (rbd_volume_exists($scfg, $storeid, $parked)) {
+            eval {
+                my $c = $rbd_cmd->($scfg, $storeid, 'rm', $parked);
+                run_rbd_command($c, errmsg => "rbd rm placeholder '$parked' error");
+            };
+            warn $@ if $@;
+        }
+
+        return { state => 'complete' };
+    }
+
+    # Still parented. Distinguish a running flatten from one that died: without this a
+    # dead flatten leaves the image parented forever and the caller polls indefinitely.
+    my $task = $rbd_flatten_task->($scfg, $name);
+    die "flatten of '$volname' is no longer running and the image is still a clone\n"
+        if !$task;
+
+    my $progress = $task->{progress};
+    return {
+        state => 'pending',
+        (defined($progress) ? (progress => int($progress * 100)) : ()),
+    };
+}
+
 sub alloc_image {
     my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
 
@@ -720,10 +995,38 @@ sub alloc_image {
     return $name;
 }
 
+# Parent (image + snapshot) of a clone, or undef if the image stands alone.
+sub rbd_volume_info_parent {
+    my ($scfg, $storeid, $volname) = @_;
+
+    my $cmd = $rbd_cmd->($scfg, $storeid, 'info', $volname, '--format', 'json');
+    my $raw = '';
+    run_rbd_command($cmd, errmsg => "rbd info '$volname' error", outfunc => sub { $raw .= shift });
+
+    return eval { decode_json($raw)->{parent} };
+}
+
 sub free_image {
     my ($class, $storeid, $scfg, $volname, $isBase) = @_;
 
     my ($vtype, $name, $vmid, undef, undef, undef) = $class->parse_volname($volname);
+
+    # Transient images from a copy to this name that died mid-flight. They are invisible
+    # to list_images(), so freeing the volume they belong to is the only occasion
+    # anything would think to look for them.
+    copy_reap_leftovers($scfg, $storeid, $name);
+
+    # An offloaded copy that never finished is still a clone of a snapshot this plugin
+    # took on the SOURCE image. Freeing the target releases the child reference but
+    # would leave that snapshot behind, pinning space and blocking deletion of the
+    # source. The clone itself is the only record of where it came from, so read the
+    # parent before removing it and drop the snapshot afterwards -- but only when it is
+    # one of ours, never a snapshot the caller supplied.
+    my $copy_parent;
+    if (my $info = eval { rbd_volume_info_parent($scfg, $storeid, $name) }) {
+        my $psnap = $info->{snapshot} // '';
+        $copy_parent = $info if $psnap =~ /^__copy_/;
+    }
 
     my $snaps = rbd_ls_snap($scfg, $storeid, $name);
     foreach my $snap (keys %$snaps) {
@@ -740,6 +1043,17 @@ sub free_image {
 
     $cmd = $rbd_cmd->($scfg, $storeid, 'rm', $name);
     run_rbd_command($cmd, errmsg => "rbd rm '$name' error");
+
+    if ($copy_parent) {
+        # Best effort: another unfinished copy may still hold the same snapshot.
+        eval {
+            my $c = $rbd_cmd->(
+                $scfg, $storeid, 'snap', 'rm', $copy_parent->{image},
+                '--snap', $copy_parent->{snapshot},
+            );
+            run_rbd_command($c, errmsg => "rbd snap rm error", outfunc => sub { });
+        };
+    }
 
     return undef;
 }
@@ -962,6 +1276,10 @@ sub volume_has_feature {
         copy => { base => 1, current => 1, snap => 1 },
         sparseinit => { base => 1, current => 1 },
         rename => { current => 1 },
+        # The copy is produced from an RBD snapshot, so it comes from a static point
+        # in time and needs no host-side mirror to stay consistent while the source
+        # keeps changing -- see copy_image_start().
+        'copy-offload-atomic' => { base => 1, current => 1, snap => 1 },
     };
 
     my ($vtype, $name, $vmid, $basename, $basevmid, $isBase) = $class->parse_volname($volname);
