@@ -8,6 +8,7 @@ use Encode qw(decode encode);
 use File::Path;
 use File::Spec;
 use IO::File;
+use JSON;
 use POSIX;
 
 use PVE::Storage::Plugin;
@@ -95,6 +96,8 @@ sub options {
         bwlimit => { optional => 1 },
         preallocation => { optional => 1 },
         'snapshot-as-volume-chain' => { optional => 1, fixed => 1 },
+        'copy-offload' => { optional => 1 },
+        'copy-offload-timeout' => { optional => 1 },
     };
 }
 
@@ -322,5 +325,142 @@ sub volume_qemu_snapshot_method {
 
     return $scfg->{'snapshot-as-volume-chain'} ? 'mixed' : 'qemu';
 }
+
+
+# qemu_img_info() returns raw JSON text, so decode before use. Returns the backing
+# filename, or undef when there is none / the image cannot be inspected.
+my sub qcow2_backing_file {
+    my ($path) = @_;
+    my $json = eval { PVE::Storage::Common::qemu_img_info($path, undef, 10) };
+    return undef if $@ || !$json;
+    my $info = eval { decode_json($json) };
+    return undef if $@ || ref($info) ne 'HASH';
+    return $info->{'backing-filename'};
+}
+
+sub volume_has_feature {
+    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
+
+    if ($feature eq 'copy-offload-atomic') {
+        # reflink clones a whole file; there is no way to pick a snapshot out of one
+        return 0 if $snapname;
+
+        my ($vtype, undef, undef, undef, undef, undef, $format) =
+            eval { $class->parse_volname($volname) };
+        return 0 if $@ || !defined($vtype) || $vtype ne 'images';
+        return 0 if $format ne 'raw' && $format ne 'qcow2';
+
+        # A qcow2 with a backing file cannot be flattened by a byte-identical copy, so
+        # do not advertise it -- otherwise the clone would fail in prepare instead of
+        # quietly taking the normal host-side path.
+        if ($format eq 'qcow2') {
+            my $path = eval { $class->filesystem_path($scfg, $volname) };
+            return 0 if $@ || !defined($path);
+            return 0 if qcow2_backing_file($path);
+        }
+
+        return 1;
+    }
+
+    return $class->SUPER::volume_has_feature(
+        $scfg, $feature, $storeid, $volname, $snapname, $running, $opts,
+    );
+}
+
+# ---- storage-offloaded full copy via reflink -------------------------------------
+#
+# A filesystem that supports FICLONE (XFS with reflink=1, btrfs, ZFS with block
+# cloning) can produce a full copy by sharing extents copy-on-write. Unlike an RBD
+# clone or a ZFS clone-from-snapshot, the result is INDEPENDENT straight away: the
+# extents are reference counted, so deleting the source does not affect the copy.
+#
+# That makes this the cheapest possible member of the 'copy-offload-atomic' class --
+# instant, no extra space, and nothing to wait for. copy_image_status() reports
+# 'complete' on the first poll because there is no background work.
+
+# Same filesystem? FICLONE cannot cross one, and the caller may be copying between
+# two different storages that happen to be directories.
+my sub same_filesystem {
+    my ($a, $b) = @_;
+    my $da = (stat($a))[0];
+    my $db = (stat($b))[0];
+    return defined($da) && defined($db) && $da == $db;
+}
+
+sub copy_image_prepare {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_vmid, $snap, $opts,
+    ) = @_;
+
+    die "copy offload cannot copy from a snapshot\n" if defined($snap);
+
+    my ($vtype, undef, undef, undef, undef, undef, $format) = $class->parse_volname($volname);
+    die "copy offload only handles VM images, not '$vtype'\n" if $vtype ne 'images';
+
+    # FICLONE copies bytes; it cannot convert between formats.
+    my $target_format = $opts->{format} // $format;
+    die "copy offload cannot convert '$format' to '$target_format'\n"
+        if $target_format ne $format;
+
+    my $path = $class->filesystem_path($scfg, $volname);
+
+    # A qcow2 with a backing file is NOT independent, and a byte-identical copy of it
+    # inherits that dependency -- it would pass qemu-img check and then break when the
+    # base is removed. Only a real convert can flatten it.
+    die "copy offload cannot flatten '$volname': it has a backing file\n"
+        if $format eq 'qcow2' && qcow2_backing_file($path);
+
+    my $target_dir = $class->get_subdir($target_scfg, 'images') . "/$target_vmid";
+    mkpath $target_dir;
+
+    die "copy offload requires source and target on the same filesystem\n"
+        if !same_filesystem($path, $target_dir);
+
+    # the trailing 1 adds the format suffix; without it the volname does not parse
+    my $name =
+        $class->find_free_diskname($target_storeid, $target_scfg, $target_vmid, $format, 1);
+
+    # Reserve the name by creating the file. The caller drops the storage lock between
+    # prepare and start, so a name that was merely chosen could be taken by a
+    # concurrent allocation -- and the caller's rollback would then delete somebody
+    # else's volume. An empty file costs nothing and makes the target freeable.
+    my $target_path = "$target_dir/$name";
+    my $fh = IO::File->new($target_path, O_WRONLY | O_CREAT | O_EXCL, 0640)
+        or die "unable to reserve '$target_path' - $!\n";
+    close($fh);
+
+    return "$target_vmid/$name";
+}
+
+sub copy_image_start {
+    my (
+        $class, $scfg, $storeid, $volname,
+        $target_scfg, $target_storeid, $target_volname, $snap,
+    ) = @_;
+
+    my $src = $class->filesystem_path($scfg, $volname);
+    my $dst = $class->filesystem_path($target_scfg, $target_volname);
+
+    # --reflink=always so an unsupported filesystem fails loudly rather than silently
+    # turning this into a full byte copy that blocks the caller -- which may be holding
+    # a guest frozen.
+    eval { PVE::Tools::run_command(['/bin/cp', '--reflink=always', '--', $src, $dst]) };
+    if (my $err = $@) {
+        unlink($dst);
+        die "reflink copy of '$volname' failed - $err";
+    }
+
+    return;
+}
+
+sub copy_image_status {
+    my ($class, $scfg, $storeid, $volname, $source) = @_;
+
+    # FICLONE is synchronous and the extents are reference counted, so the copy is
+    # already independent of its source. Nothing to poll and nothing to clean up.
+    return { state => 'complete' };
+}
+
 
 1;
